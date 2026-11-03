@@ -25,13 +25,14 @@ import kotlin.coroutines.cancellation.CancellationException
 
 class MainActivity : Activity() {
 
+    private data class FpsChoice(val fps: Int?, val interpolate: Boolean)
+
     private var videoUri: Uri? = null
     private var resultUri: Uri? = null
     private var lut: CubeLut? = null
-    private var source: SdrToHdrTranscoder.SourceInfo? = null
     private var lastSpace = OutputSpace.HDR10_PQ
     private var resValues: List<Int?> = listOf(null)
-    private var fpsValues: List<Int?> = listOf(null)
+    private var fpsValues: List<FpsChoice> = listOf(FpsChoice(null, false))
 
     private lateinit var preview: VideoView
     private lateinit var info: TextView
@@ -45,15 +46,31 @@ class MainActivity : Activity() {
     private lateinit var resSpinner: Spinner
     private lateinit var fpsSpinner: Spinner
     private lateinit var strengthBar: SeekBar
-    private lateinit var expandBar: SeekBar
+    private lateinit var brightnessBar: SeekBar
+    private lateinit var effectBar: SeekBar
+    private lateinit var sharpBar: SeekBar
     @Volatile private var cancelled = false
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-
     private fun label(t: String) = TextView(this).apply { text = t; setPadding(0, dp(12), 0, 0) }
-
     private fun spinner(items: List<String>) = Spinner(this).apply {
         adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items)
+    }
+
+    /** Adds a titled slider whose title shows the current value. */
+    private fun seekRow(root: LinearLayout, title: String, max: Int, initial: Int, fmt: (Int) -> String): SeekBar {
+        val tv = TextView(this).apply { setPadding(0, dp(12), 0, 0) }
+        val bar = SeekBar(this).apply { this.max = max; progress = initial }
+        fun update() { tv.text = "$title: ${fmt(bar.progress)}" }
+        bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) = update()
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        update()
+        root.addView(tv)
+        root.addView(bar)
+        return bar
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -67,7 +84,7 @@ class MainActivity : Activity() {
         // ---- Preview ----
         preview = VideoView(this)
         preview.setMediaController(MediaController(this).also { it.setAnchorView(preview) })
-        preview.setOnPreparedListener { preview.seekTo(1) }   // show first frame
+        preview.setOnPreparedListener { preview.seekTo(1) }
         root.addView(preview, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(220)))
 
         val previewRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -89,18 +106,17 @@ class MainActivity : Activity() {
         spaceSpinner = spinner(OutputSpace.values().map { it.label })   // default = HDR10 PQ
         resSpinner = spinner(listOf("Source"))
         fpsSpinner = spinner(listOf("Source"))
-        strengthBar = SeekBar(this).apply { max = 100; progress = 100 }
-        expandBar = SeekBar(this).apply { max = 100; progress = 25 }
         root.addView(label("Colour space"))
         root.addView(spaceSpinner)
         root.addView(label("Resolution"))
         root.addView(resSpinner)
         root.addView(label("Frame rate"))
         root.addView(fpsSpinner)
-        root.addView(label("LUT strength"))
-        root.addView(strengthBar)
-        root.addView(label("Highlight expansion"))
-        root.addView(expandBar)
+
+        strengthBar = seekRow(root, "LUT strength", 100, 100) { "$it%" }
+        brightnessBar = seekRow(root, "Brightness (SDR white)", 100, 30) { "${100 + it * 10} nits" }
+        effectBar = seekRow(root, "HDR effect (highlight boost)", 100, 30) { "$it%" }
+        sharpBar = seekRow(root, "Sharpness", 100, 0) { "$it%" }
 
         // ---- Run ----
         convertBtn = Button(this).apply { text = "3. Convert"; isEnabled = false }
@@ -159,7 +175,6 @@ class MainActivity : Activity() {
             return
         }
         videoUri = uri
-        source = src
         previewSourceBtn.isEnabled = true
         playInPreview(uri, hdr = false)
 
@@ -168,20 +183,26 @@ class MainActivity : Activity() {
             (if (src.rotation != 0) ", rotated ${src.rotation}°" else "") +
             if (src.isHdr) " (already HDR)" else " (SDR)"
 
-        // Resolution choices: source plus any standard size below it (by short side)
+        // Resolution: source, plus standard sizes above (upscale) and below (downscale)
         val resLabels = mutableListOf("Source (${src.width}x${src.height})")
         val resVals = mutableListOf<Int?>(null)
         for (s in listOf(2160, 1440, 1080, 720, 480)) {
-            if (s < shortSide) { resLabels.add("${s}p"); resVals.add(s) }
+            if (s == shortSide) continue
+            resLabels.add(if (s > shortSide) "${s}p (upscale)" else "${s}p")
+            resVals.add(s)
         }
         resValues = resVals
         resSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, resLabels)
 
-        // Frame-rate choices: source plus common lower rates (frames are dropped, never invented)
+        // Frame rate: source, lower rates (drop frames), or 2x via optical flow
         val fpsLabels = mutableListOf("Source (${src.fps} fps)")
-        val fpsVals = mutableListOf<Int?>(null)
+        val fpsVals = mutableListOf(FpsChoice(null, false))
         for (f in listOf(60, 50, 30, 25, 24)) {
-            if (f < src.fps) { fpsLabels.add("$f fps"); fpsVals.add(f) }
+            if (f < src.fps) { fpsLabels.add("$f fps (drop frames)"); fpsVals.add(FpsChoice(f, false)) }
+        }
+        if (src.fps <= 30) {
+            fpsLabels.add("${src.fps * 2} fps (optical flow, slow)")
+            fpsVals.add(FpsChoice(null, true))
         }
         fpsValues = fpsVals
         fpsSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, fpsLabels)
@@ -198,13 +219,17 @@ class MainActivity : Activity() {
     private fun startConversion() {
         val input = videoUri ?: return
         val space = OutputSpace.values()[spaceSpinner.selectedItemPosition]
+        val fps = fpsValues.getOrElse(fpsSpinner.selectedItemPosition) { FpsChoice(null, false) }
         val options = SdrToHdrTranscoder.Options(
             lut = lut,
             lutStrength = strengthBar.progress / 100f,
-            expand = expandBar.progress / 100f,
             space = space,
+            whiteNits = 100f + brightnessBar.progress * 10f,
+            hdrEffect = effectBar.progress / 100f,
+            sharpen = sharpBar.progress / 100f * 1.5f,
             targetShortSide = resValues.getOrNull(resSpinner.selectedItemPosition),
-            targetFps = fpsValues.getOrNull(fpsSpinner.selectedItemPosition)
+            targetFps = fps.fps,
+            interpolate2x = fps.interpolate
         )
 
         convertBtn.isEnabled = false
